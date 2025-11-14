@@ -72,6 +72,7 @@ private:
     int current_traj_index_;
     ros::Time traj_start_time_;
     ros::Time last_goal_time_;
+    double last_yaw_ = 0.0;  // 记录最近一次发布的偏航角
     
     // 参数
     double max_vel_;           // 最大速度
@@ -92,6 +93,14 @@ private:
         ROS_INFO("  max_vel: %.2f m/s", max_vel_);
         ROS_INFO("  max_acc: %.2f m/s^2", max_acc_);
         ROS_INFO("  goal_tolerance: %.2f m", goal_tolerance_);
+    }
+
+    // 将角度归一化到 [-pi, pi]
+    static double normalizeAngle(double ang)
+    {
+        while (ang > M_PI) ang -= 2.0 * M_PI;
+        while (ang < -M_PI) ang += 2.0 * M_PI;
+        return ang;
     }
     
     void initPubSub()
@@ -227,9 +236,41 @@ private:
             final_point.position = target_pos_;
             final_point.velocity = Eigen::Vector3d::Zero();
             final_point.acceleration = Eigen::Vector3d::Zero();
-            final_point.yaw = 0.0;
+            final_point.yaw = last_yaw_;
             final_point.time = total_time;
             trajectory_.push_back(final_point);
+        }
+
+        // 基于速度/位移方向计算每个点的偏航角
+        if (!trajectory_.empty())
+        {
+            double yaw_prev = last_yaw_;
+            for (size_t i = 0; i < trajectory_.size(); ++i)
+            {
+                const auto& pt = trajectory_[i];
+                double vx = pt.velocity.x();
+                double vy = pt.velocity.y();
+                double yaw = yaw_prev;
+
+                // 优先使用速度方向
+                if (std::hypot(vx, vy) > 1e-3)
+                {
+                    yaw = std::atan2(vy, vx);
+                }
+                else if (i + 1 < trajectory_.size())
+                {
+                    // 使用相邻点的位移方向
+                    Eigen::Vector3d d = trajectory_[i + 1].position - pt.position;
+                    if (std::hypot(d.x(), d.y()) > 1e-3)
+                    {
+                        yaw = std::atan2(d.y(), d.x());
+                    }
+                }
+
+                yaw = normalizeAngle(yaw);
+                trajectory_[i].yaw = yaw;
+                yaw_prev = yaw;
+            }
         }
         
         // 可视化轨迹
@@ -312,7 +353,8 @@ private:
         point.position = current_pos_ + direction * s;
         point.velocity = direction * std::max(0.0, v);
         point.acceleration = direction * a;
-        point.yaw = 0.0;  // 简化版不考虑偏航
+    // yaw 在生成轨迹后统一计算
+    point.yaw = last_yaw_;
         point.time = t;
     }
     
@@ -366,6 +408,9 @@ private:
         cmd.yaw_dot = 0.0;
         
         pos_cmd_pub_.publish(cmd);
+
+    // 记录已发布的偏航角
+    last_yaw_ = point.yaw;
     }
     
     void publishStopCommand()
