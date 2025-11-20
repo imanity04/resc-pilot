@@ -207,70 +207,53 @@ private:
             return false;
         }
         
-        // 简化的轨迹规划：直线轨迹 + 梯形速度曲线
-        Eigen::Vector3d direction = (target_pos_ - current_pos_).normalized();
+        // 两段轨迹规划：
+        // 第一段：保持当前高度，在xy平面上移动到目标点正上方
+        // 第二段：垂直下降到目标点
         
-        // 计算运动时间
-        double total_time = calculateOptimalTime(distance);
+        // 第一段：水平移动
+        Eigen::Vector3d horizontal_start = current_pos_;
+        Eigen::Vector3d horizontal_target(target_pos_.x(), target_pos_.y(), current_pos_.z());
+        double horizontal_distance = (horizontal_target - horizontal_start).norm();
         
-        // 生成轨迹点
-        int num_points = static_cast<int>(total_time / dt_) + 1;
-        trajectory_.reserve(num_points);
+        // 第二段：垂直移动
+        Eigen::Vector3d vertical_start = horizontal_target;
+        Eigen::Vector3d vertical_target = target_pos_;
+        double vertical_distance = std::abs(vertical_target.z() - vertical_start.z());
         
-        for (int i = 0; i < num_points; ++i)
+        // 生成第一段轨迹（水平移动）
+        if (horizontal_distance > goal_tolerance_)
         {
-            double t = i * dt_;
-            if (t > total_time) t = total_time;
-            
-            TrajectoryPoint point;
-            
-            // 使用梯形速度曲线计算位置、速度、加速度
-            calculateTrajectoryPoint(t, total_time, distance, direction, point);
-            
-            trajectory_.push_back(point);
+            generateHorizontalTrajectory(horizontal_start, horizontal_target, horizontal_distance);
         }
         
-        // 添加最终点确保到达目标
-        if (!trajectory_.empty()) {
+        // 生成第二段轨迹（垂直移动）
+        if (vertical_distance > goal_tolerance_)
+        {
+            generateVerticalTrajectory(vertical_start, vertical_target, vertical_distance);
+        }
+        
+        // 如果没有生成轨迹点，直接到目标
+        if (trajectory_.empty())
+        {
             TrajectoryPoint final_point;
             final_point.position = target_pos_;
             final_point.velocity = Eigen::Vector3d::Zero();
             final_point.acceleration = Eigen::Vector3d::Zero();
             final_point.yaw = last_yaw_;
-            final_point.time = total_time;
+            final_point.time = 0.0;
             trajectory_.push_back(final_point);
         }
-
-        // 基于速度/位移方向计算每个点的偏航角
-        if (!trajectory_.empty())
+        else
         {
-            double yaw_prev = last_yaw_;
-            for (size_t i = 0; i < trajectory_.size(); ++i)
-            {
-                const auto& pt = trajectory_[i];
-                double vx = pt.velocity.x();
-                double vy = pt.velocity.y();
-                double yaw = yaw_prev;
-
-                // 优先使用速度方向
-                if (std::hypot(vx, vy) > 1e-3)
-                {
-                    yaw = std::atan2(vy, vx);
-                }
-                else if (i + 1 < trajectory_.size())
-                {
-                    // 使用相邻点的位移方向
-                    Eigen::Vector3d d = trajectory_[i + 1].position - pt.position;
-                    if (std::hypot(d.x(), d.y()) > 1e-3)
-                    {
-                        yaw = std::atan2(d.y(), d.x());
-                    }
-                }
-
-                yaw = normalizeAngle(yaw);
-                trajectory_[i].yaw = yaw;
-                yaw_prev = yaw;
-            }
+            // 确保最后一个点到达目标位置
+            TrajectoryPoint final_point;
+            final_point.position = target_pos_;
+            final_point.velocity = Eigen::Vector3d::Zero();
+            final_point.acceleration = Eigen::Vector3d::Zero();
+            final_point.yaw = trajectory_.back().yaw;
+            final_point.time = trajectory_.back().time + dt_;
+            trajectory_.push_back(final_point);
         }
         
         // 可视化轨迹
@@ -298,8 +281,143 @@ private:
         }
     }
     
+    double calculateOptimalTimeWithMaxVel(double distance, double limited_max_vel)
+    {
+        // 使用限制的最大速度计算时间
+        double acc_time = limited_max_vel / max_acc_;
+        double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
+        
+        if (2 * acc_dist >= distance)
+        {
+            // 三角形速度曲线
+            return 2.0 * sqrt(distance / max_acc_);
+        }
+        else
+        {
+            // 梯形速度曲线
+            double const_vel_dist = distance - 2 * acc_dist;
+            return 2 * acc_time + const_vel_dist / limited_max_vel;
+        }
+    }
+    
+    void generateHorizontalTrajectory(const Eigen::Vector3d& start, 
+                                      const Eigen::Vector3d& target, 
+                                      double distance)
+    {
+        if (distance < 1e-3) return;
+        
+        Eigen::Vector3d direction = (target - start).normalized();
+        double total_time = calculateOptimalTime(distance);
+        
+        // 获取当前轨迹的时间偏移
+        double time_offset = trajectory_.empty() ? 0.0 : trajectory_.back().time + dt_;
+        
+        // 生成轨迹点
+        int num_points = static_cast<int>(total_time / dt_) + 1;
+        
+        for (int i = 0; i < num_points; ++i)
+        {
+            double t = i * dt_;
+            if (t > total_time) t = total_time;
+            
+            TrajectoryPoint point;
+            
+            // 使用梯形速度曲线计算位置、速度、加速度
+            calculateTrajectoryPoint(t, total_time, distance, direction, start, point);
+            point.time += time_offset;
+            
+            trajectory_.push_back(point);
+        }
+        
+        // 计算水平移动轨迹的偏航角
+        updateTrajectoryYaw();
+    }
+    
+    void generateVerticalTrajectory(const Eigen::Vector3d& start, 
+                                    const Eigen::Vector3d& target, 
+                                    double distance)
+    {
+        if (distance < 1e-3) return;
+        
+        Eigen::Vector3d direction = (target - start).normalized();
+        
+        // 对于垂直移动，限制最大速度为0.5m/s
+        double vertical_max_vel = 0.5;
+        double total_time = calculateOptimalTimeWithMaxVel(distance, vertical_max_vel);
+        
+        // 获取当前轨迹的时间偏移
+        double time_offset = trajectory_.empty() ? 0.0 : trajectory_.back().time + dt_;
+        
+        // 生成轨迹点
+        int num_points = static_cast<int>(total_time / dt_) + 1;
+        
+        for (int i = 0; i < num_points; ++i)
+        {
+            double t = i * dt_;
+            if (t > total_time) t = total_time;
+            
+            TrajectoryPoint point;
+            
+            // 使用梯形速度曲线计算位置、速度、加速度（使用限制的最大速度）
+            calculateTrajectoryPointWithMaxVel(t, total_time, distance, direction, start, point, vertical_max_vel);
+            point.time += time_offset;
+            
+            // 垂直移动时保持最后一个水平运动的偏航角
+            point.yaw = trajectory_.empty() ? last_yaw_ : trajectory_.back().yaw;
+            
+            trajectory_.push_back(point);
+        }
+    }
+    
+    void updateTrajectoryYaw()
+    {
+        if (trajectory_.empty()) return;
+        
+        // 计算水平移动段的偏航角
+        size_t start_index = 0;
+        
+        // 找到当前段的起始位置
+        for (size_t i = 1; i < trajectory_.size(); ++i)
+        {
+            if (std::abs(trajectory_[i].position.z() - trajectory_[i-1].position.z()) > 1e-3)
+            {
+                start_index = i;
+                break;
+            }
+        }
+        
+        double yaw_prev = last_yaw_;
+        for (size_t i = start_index; i < trajectory_.size(); ++i)
+        {
+            const auto& pt = trajectory_[i];
+            double vx = pt.velocity.x();
+            double vy = pt.velocity.y();
+            double yaw = yaw_prev;
+
+            // 优先使用速度方向
+            if (std::hypot(vx, vy) > 1e-3)
+            {
+                yaw = std::atan2(vy, vx);
+            }
+            else if (i + 1 < trajectory_.size())
+            {
+                // 使用相邻点的位移方向
+                Eigen::Vector3d d = trajectory_[i + 1].position - pt.position;
+                if (std::hypot(d.x(), d.y()) > 1e-3)
+                {
+                    yaw = std::atan2(d.y(), d.x());
+                }
+            }
+
+            yaw = normalizeAngle(yaw);
+            trajectory_[i].yaw = yaw;
+            yaw_prev = yaw;
+        }
+    }
+    
     void calculateTrajectoryPoint(double t, double total_time, double total_distance, 
-                                  const Eigen::Vector3d& direction, TrajectoryPoint& point)
+                                  const Eigen::Vector3d& direction, const Eigen::Vector3d& start_pos,
+                                  TrajectoryPoint& point)
     {
         double acc_time = max_vel_ / max_acc_;
         double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
@@ -350,11 +468,72 @@ private:
         }
         
         // 转换为3D向量
-        point.position = current_pos_ + direction * s;
+        point.position = start_pos + direction * s;
         point.velocity = direction * std::max(0.0, v);
         point.acceleration = direction * a;
-    // yaw 在生成轨迹后统一计算
-    point.yaw = last_yaw_;
+        // yaw 在生成轨迹后统一计算
+        point.yaw = last_yaw_;
+        point.time = t;
+    }
+    
+    void calculateTrajectoryPointWithMaxVel(double t, double total_time, double total_distance, 
+                                            const Eigen::Vector3d& direction, const Eigen::Vector3d& start_pos,
+                                            TrajectoryPoint& point, double limited_max_vel)
+    {
+        double acc_time = limited_max_vel / max_acc_;
+        double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
+        
+        double s, v, a;  // 位置、速度、加速度标量值
+        
+        if (2 * acc_dist >= total_distance)
+        {
+            // 三角形速度曲线
+            double peak_time = total_time / 2.0;
+            if (t <= peak_time)
+            {
+                s = 0.5 * max_acc_ * t * t;
+                v = max_acc_ * t;
+                a = max_acc_;
+            }
+            else
+            {
+                double dt_from_peak = t - peak_time;
+                double peak_vel = max_acc_ * peak_time;
+                s = acc_dist + peak_vel * dt_from_peak - 0.5 * max_acc_ * dt_from_peak * dt_from_peak;
+                v = peak_vel - max_acc_ * dt_from_peak;
+                a = -max_acc_;
+            }
+        }
+        else
+        {
+            // 梯形速度曲线
+            if (t <= acc_time)
+            {
+                s = 0.5 * max_acc_ * t * t;
+                v = max_acc_ * t;
+                a = max_acc_;
+            }
+            else if (t <= total_time - acc_time)
+            {
+                s = acc_dist + limited_max_vel * (t - acc_time);
+                v = limited_max_vel;
+                a = 0.0;
+            }
+            else
+            {
+                double dt_from_decel = t - (total_time - acc_time);
+                s = total_distance - acc_dist + limited_max_vel * dt_from_decel - 0.5 * max_acc_ * dt_from_decel * dt_from_decel;
+                v = limited_max_vel - max_acc_ * dt_from_decel;
+                a = -max_acc_;
+            }
+        }
+        
+        // 转换为3D向量
+        point.position = start_pos + direction * s;
+        point.velocity = direction * std::max(0.0, v);
+        point.acceleration = direction * a;
+        // yaw 在生成轨迹后统一计算
+        point.yaw = last_yaw_;
         point.time = t;
     }
     
