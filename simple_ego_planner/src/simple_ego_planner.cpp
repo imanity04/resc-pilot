@@ -85,7 +85,7 @@ private:
     {
         nh_.param("max_vel", max_vel_, 1.5);
         nh_.param("max_acc", max_acc_, 2.0);
-        nh_.param("goal_tolerance", goal_tolerance_, 0.25);
+        nh_.param("goal_tolerance", goal_tolerance_, 0.5);
         nh_.param("dt", dt_, 0.1);
         nh_.param("publish_rate", publish_rate_, 20.0);
         
@@ -362,8 +362,15 @@ private:
             calculateTrajectoryPointWithMaxVel(t, total_time, distance, direction, start, point, vertical_max_vel);
             point.time += time_offset;
             
-            // 垂直移动时保持最后一个水平运动的偏航角
-            point.yaw = trajectory_.empty() ? last_yaw_ : trajectory_.back().yaw;
+            // 垂直移动时平滑地将偏航角归零
+            double initial_yaw = trajectory_.empty() ? last_yaw_ : trajectory_.back().yaw;
+            double target_yaw = 0.0;
+            double yaw_progress = t / total_time;  // 从0到1的进度
+            
+            // 使用余弦插值实现更平滑的偏航角过渡
+            double smooth_progress = (1.0 - cos(yaw_progress * M_PI)) * 0.5;
+            point.yaw = initial_yaw * (1.0 - smooth_progress) + target_yaw * smooth_progress;
+            point.yaw = normalizeAngle(point.yaw);
             
             trajectory_.push_back(point);
         }
@@ -588,8 +595,8 @@ private:
         
         pos_cmd_pub_.publish(cmd);
 
-    // 记录已发布的偏航角
-    last_yaw_ = point.yaw;
+        // 记录已发布的偏航角
+        last_yaw_ = point.yaw;
     }
     
     void publishStopCommand()
@@ -612,10 +619,13 @@ private:
         cmd.acceleration.y = 0.0;
         cmd.acceleration.z = 0.0;
         
+        // 停止时偏航角归零，与垂直移动的最终状态保持一致
         cmd.yaw = 0.0;
         cmd.yaw_dot = 0.0;
         
         pos_cmd_pub_.publish(cmd);
+        
+        ROS_INFO("[SimpleEgoPlanner] Published stop command with yaw: 0.0 rad (0.0 deg)");
     }
     
     bool isGoalReached()

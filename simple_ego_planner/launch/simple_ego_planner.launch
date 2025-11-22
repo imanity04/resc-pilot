@@ -3,9 +3,9 @@
   <!-- 用于替代复杂的ego-planner，为PX4CtrlFSM提供轨迹规划服务 -->
   
   <!-- 参数设置 -->
-  <arg name="max_vel" default="1.5" />
-  <arg name="max_acc" default="2.0" />
-  <arg name="goal_tolerance" default="0.25" />
+  <arg name="max_vel" default="3.0" />
+  <arg name="max_acc" default="4.5" />
+  <arg name="goal_tolerance" default="0.5" />
   <arg name="dt" default="0.1" />
   <arg name="publish_rate" default="20.0" />
   <arg name="use_rviz" default="false" />
