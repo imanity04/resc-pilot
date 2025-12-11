@@ -9,6 +9,7 @@
   <arg name="dt" default="0.1" />
   <arg name="publish_rate" default="20.0" />
   <arg name="use_rviz" default="false" />
+  <arg name="range_threshold" default="2.0" />
   
   <!-- 启动简化版ego-planner节点 -->
   <node pkg="simple_ego_planner" name="simple_ego_planner" type="simple_ego_planner_node" output="screen">
@@ -24,12 +25,9 @@
     <remap from="~pos_cmd" to="/planning/pos_cmd" />
   </node>
   
-  <!-- 可选：启动RViz进行可视化 -->
-  <!--group if="$(arg use_rviz)">
-    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find simple_ego_planner)/launch/simple_ego_planner.rviz" />
-  </group-->
-  
-  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find simple_ego_planner)/launch/test.rviz" required="true" />
+  <group if="$(arg use_rviz)">
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find simple_ego_planner)/launch/test.rviz" required="true" />
+  </group>
   
   <!-- 静态变换发布器 (确保坐标系一致) -->
   <node pkg="tf2_ros" type="static_transform_publisher" name="world_to_map" 

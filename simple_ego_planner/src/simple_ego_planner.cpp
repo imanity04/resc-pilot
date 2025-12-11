@@ -1,9 +1,14 @@
+//UPDATED (zhiyuan 11_28): Two-stage trajectory planning - horizontal movement followed by vertical descent
+//When altimeter distance < 2.0m, target is considered reached, notify PX4CtrlFSM to enter GPS correction phase
+//Ctrl + F:"range < range_threshold_" to change the threshold
+
 #include <ros/ros.h>
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <quadrotor_msgs/PositionCommand.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
+#include <sensor_msgs/LaserScan.h>
 #include <Eigen/Eigen>
 #include <iostream>
 #include <vector>
@@ -14,18 +19,21 @@ class SimpleEgoPlanner
 public:
     SimpleEgoPlanner(ros::NodeHandle& nh) : nh_(nh)
     {
-        // 初始化参数
+        // Initialize parameters
         initParameters();
         
-        // 初始化发布者和订阅者
+        // Initialize publishers and subscribers
         initPubSub();
         
-        // 初始化状态
+        // Initialize state
         current_state_ = IDLE;
         has_odom_ = false;
         has_target_ = false;
+        is_in_vertical_phase_ = false;
+        latest_scan_ = nullptr;
+        last_scan_time_ = ros::Time(0);
         
-        // 创建定时器
+        // Create timer
         plan_timer_ = nh_.createTimer(ros::Duration(0.05), &SimpleEgoPlanner::planTimerCallback, this);
         
         ROS_INFO("[SimpleEgoPlanner] Initialized successfully!");
@@ -34,9 +42,9 @@ public:
 private:
     enum PlannerState
     {
-        IDLE,           // 空闲状态
-        PLANNING,       // 规划中
-        EXECUTING       // 执行轨迹
+        IDLE,           // Idle state
+        PLANNING,       // Planning
+        EXECUTING       // Executing trajectory
     };
 
     struct TrajectoryPoint
@@ -48,38 +56,45 @@ private:
         double time;
     };
 
-    // ROS相关
+    // ROS related
     ros::NodeHandle nh_;
     ros::Subscriber odom_sub_;
     ros::Subscriber target_sub_;
+    ros::Subscriber lidar_sub_;  // New LiDAR subscriber
     ros::Publisher pos_cmd_pub_;
     ros::Publisher traj_vis_pub_;
     ros::Publisher goal_vis_pub_;
     ros::Timer plan_timer_;
 
-    // 状态变量
+    // State variables
     PlannerState current_state_;
     bool has_odom_;
     bool has_target_;
+    bool is_in_vertical_phase_;  // Whether in vertical descent phase
     
-    // 当前状态
+    // LiDAR data
+    sensor_msgs::LaserScan::ConstPtr latest_scan_;  // Latest LiDAR data
+    ros::Time last_scan_time_;  // Last time LiDAR data was received
+    
+    // Current state
     Eigen::Vector3d current_pos_;
     Eigen::Vector3d current_vel_;
     Eigen::Vector3d target_pos_;
     
-    // 轨迹
+    // Trajectory
     std::vector<TrajectoryPoint> trajectory_;
     int current_traj_index_;
     ros::Time traj_start_time_;
     ros::Time last_goal_time_;
-    double last_yaw_ = 0.0;  // 记录最近一次发布的偏航角
+    double last_yaw_ = 0.0;  // Record the last published yaw angle
     
-    // 参数
-    double max_vel_;           // 最大速度
-    double max_acc_;           // 最大加速度
-    double goal_tolerance_;    // 目标容忍度
-    double dt_;               // 时间步长
-    double publish_rate_;     // 发布频率
+    // Parameters
+    double max_vel_;           // Maximum velocity
+    double max_acc_;           // Maximum acceleration
+    double goal_tolerance_;    // Goal tolerance
+    double dt_;               // Time step
+    double publish_rate_;     // Publish rate
+    double range_threshold_;  // New parameter for range threshold
     
     void initParameters()
     {
@@ -88,6 +103,7 @@ private:
         nh_.param("goal_tolerance", goal_tolerance_, 0.5);
         nh_.param("dt", dt_, 0.1);
         nh_.param("publish_rate", publish_rate_, 20.0);
+        nh_.param("range_threshold", range_threshold_, 2.0);  // New parameter for range threshold
         
         ROS_INFO("[SimpleEgoPlanner] Parameters loaded:");
         ROS_INFO("  max_vel: %.2f m/s", max_vel_);
@@ -95,7 +111,7 @@ private:
         ROS_INFO("  goal_tolerance: %.2f m", goal_tolerance_);
     }
 
-    // 将角度归一化到 [-pi, pi]
+    // Normalize angle to [-pi, pi]
     static double normalizeAngle(double ang)
     {
         while (ang > M_PI) ang -= 2.0 * M_PI;
@@ -105,11 +121,12 @@ private:
     
     void initPubSub()
     {
-        // 订阅者 - 使用与PX4CtrlFSM相同的话题
+        // Subscribers - use same topics as PX4CtrlFSM
         odom_sub_ = nh_.subscribe("/mavros/local_position/pose", 1, &SimpleEgoPlanner::odomCallback, this);
         target_sub_ = nh_.subscribe("/move_base_simple/goal", 1, &SimpleEgoPlanner::targetCallback, this);
+        lidar_sub_ = nh_.subscribe("/scan", 1, &SimpleEgoPlanner::lidarCallback, this);  // Subscribe to LiDAR data
         
-        // 发布者 - 发布到PX4CtrlFSM期望的话题
+        // Publishers - publish to topics expected by PX4CtrlFSM
         pos_cmd_pub_ = nh_.advertise<quadrotor_msgs::PositionCommand>("/planning/pos_cmd", 10);
         traj_vis_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/simple_planner/trajectory", 10);
         goal_vis_pub_ = nh_.advertise<visualization_msgs::Marker>("/simple_planner/goal", 10);
@@ -121,7 +138,7 @@ private:
                         msg->pose.position.y, 
                         msg->pose.position.z;
         
-        // 简单的数值微分估计速度
+        // Simple numerical differentiation to estimate velocity
         static Eigen::Vector3d last_pos = current_pos_;
         static ros::Time last_time = ros::Time::now();
         
@@ -150,8 +167,41 @@ private:
         ROS_INFO("[SimpleEgoPlanner] New target received: (%.2f, %.2f, %.2f)", 
                  target_pos_.x(), target_pos_.y(), target_pos_.z());
         
-        // 可视化目标点
+        // Visualize target point
         publishGoalVisualization();
+    }
+    
+    void lidarCallback(const sensor_msgs::LaserScan::ConstPtr& msg)
+    {
+        // Store latest LiDAR data
+        latest_scan_ = msg;
+        last_scan_time_ = ros::Time::now();
+    }
+    
+    bool checkHeightForTargetReached()
+    {
+        // Check if we have latest LiDAR data
+        if (!latest_scan_ || !is_in_vertical_phase_)
+            return false;
+            
+        // Check if data is fresh enough (within 1 second)
+        if ((ros::Time::now() - last_scan_time_).toSec() > 1.0)
+        {
+            ROS_WARN("[SimpleEgoPlanner] Laser scan data is too old!");
+            return false;
+        }
+        
+        // Check if any distance in ranges array is less than 2.0m
+        for (const auto& range : latest_scan_->ranges)
+        {
+            if (range > 0.1 && range < range_threshold_)  // Filter out invalid data, check valid distances
+            {
+                ROS_INFO("[SimpleEgoPlanner] Target reached! Height: %.2fm. Ready for GPS correction.", range);
+                return true;
+            }
+        }
+        
+        return false;
     }
     
     void planTimerCallback(const ros::TimerEvent& /*event*/)
@@ -185,7 +235,7 @@ private:
                     current_state_ = IDLE;
                     has_target_ = false;
                     ROS_INFO("[SimpleEgoPlanner] Goal reached!");
-                    // 发布停止命令
+                    // Publish stop command
                     publishStopCommand();
                 }
                 else
@@ -199,41 +249,39 @@ private:
     bool planTrajectory()
     {
         trajectory_.clear();
+        is_in_vertical_phase_ = false;
         
-        // 检查是否已经到达目标
+        // Check if already reached target
         double distance = (target_pos_ - current_pos_).norm();
         if (distance < goal_tolerance_)
         {
             return false;
         }
         
-        // 两段轨迹规划：
-        // 第一段：保持当前高度，在xy平面上移动到目标点正上方
-        // 第二段：垂直下降到目标点
-        
-        // 第一段：水平移动
+        // Two-stage trajectory planning
+        // First stage: horizontal movement to above target
         Eigen::Vector3d horizontal_start = current_pos_;
         Eigen::Vector3d horizontal_target(target_pos_.x(), target_pos_.y(), current_pos_.z());
         double horizontal_distance = (horizontal_target - horizontal_start).norm();
         
-        // 第二段：垂直移动
+        // Second stage: vertical descent to target
         Eigen::Vector3d vertical_start = horizontal_target;
-        Eigen::Vector3d vertical_target = target_pos_;
+        Eigen::Vector3d vertical_target(target_pos_.x(), target_pos_.y(), 0.0);
         double vertical_distance = std::abs(vertical_target.z() - vertical_start.z());
         
-        // 生成第一段轨迹（水平移动）
+        // Generate horizontal movement trajectory
         if (horizontal_distance > goal_tolerance_)
         {
             generateHorizontalTrajectory(horizontal_start, horizontal_target, horizontal_distance);
         }
         
-        // 生成第二段轨迹（垂直移动）
+        // Generate vertical descent trajectory
         if (vertical_distance > goal_tolerance_)
         {
             generateVerticalTrajectory(vertical_start, vertical_target, vertical_distance);
         }
         
-        // 如果没有生成轨迹点，直接到目标
+        // If no trajectory points generated, go directly to target
         if (trajectory_.empty())
         {
             TrajectoryPoint final_point;
@@ -246,7 +294,7 @@ private:
         }
         else
         {
-            // 确保最后一个点到达目标位置
+            // Ensure last point reaches target position
             TrajectoryPoint final_point;
             final_point.position = target_pos_;
             final_point.velocity = Eigen::Vector3d::Zero();
@@ -256,7 +304,7 @@ private:
             trajectory_.push_back(final_point);
         }
         
-        // 可视化轨迹
+        // Visualize trajectory
         publishTrajectoryVisualization();
         
         return !trajectory_.empty();
@@ -264,18 +312,18 @@ private:
     
     double calculateOptimalTime(double distance)
     {
-        // 梯形速度曲线的时间计算
+        // Time calculation for trapezoidal velocity curve
         double acc_time = max_vel_ / max_acc_;
         double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
         
         if (2 * acc_dist >= distance)
         {
-            // 三角形速度曲线
+            // Triangular velocity curve
             return 2.0 * sqrt(distance / max_acc_);
         }
         else
         {
-            // 梯形速度曲线
+            // Trapezoidal velocity curve
             double const_vel_dist = distance - 2 * acc_dist;
             return 2 * acc_time + const_vel_dist / max_vel_;
         }
@@ -283,18 +331,18 @@ private:
     
     double calculateOptimalTimeWithMaxVel(double distance, double limited_max_vel)
     {
-        // 使用限制的最大速度计算时间
+        // Calculate time using limited maximum velocity
         double acc_time = limited_max_vel / max_acc_;
         double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
         
         if (2 * acc_dist >= distance)
         {
-            // 三角形速度曲线
+            // Triangular velocity curve
             return 2.0 * sqrt(distance / max_acc_);
         }
         else
         {
-            // 梯形速度曲线
+            // Trapezoidal velocity curve
             double const_vel_dist = distance - 2 * acc_dist;
             return 2 * acc_time + const_vel_dist / limited_max_vel;
         }
@@ -309,10 +357,10 @@ private:
         Eigen::Vector3d direction = (target - start).normalized();
         double total_time = calculateOptimalTime(distance);
         
-        // 获取当前轨迹的时间偏移
+        // Get time offset for current trajectory
         double time_offset = trajectory_.empty() ? 0.0 : trajectory_.back().time + dt_;
         
-        // 生成轨迹点
+        // Generate trajectory points
         int num_points = static_cast<int>(total_time / dt_) + 1;
         
         for (int i = 0; i < num_points; ++i)
@@ -322,14 +370,14 @@ private:
             
             TrajectoryPoint point;
             
-            // 使用梯形速度曲线计算位置、速度、加速度
+            // Use trapezoidal velocity curve to calculate position, velocity, acceleration
             calculateTrajectoryPoint(t, total_time, distance, direction, start, point);
             point.time += time_offset;
             
             trajectory_.push_back(point);
         }
         
-        // 计算水平移动轨迹的偏航角
+        // Calculate yaw for horizontal movement trajectory
         updateTrajectoryYaw();
     }
     
@@ -341,14 +389,14 @@ private:
         
         Eigen::Vector3d direction = (target - start).normalized();
         
-        // 对于垂直移动，限制最大速度为0.5m/s
+        // For vertical movement, limit maximum velocity to 0.5m/s
         double vertical_max_vel = 0.5;
         double total_time = calculateOptimalTimeWithMaxVel(distance, vertical_max_vel);
         
-        // 获取当前轨迹的时间偏移
+        // Get time offset for current trajectory
         double time_offset = trajectory_.empty() ? 0.0 : trajectory_.back().time + dt_;
         
-        // 生成轨迹点
+        // Generate trajectory points
         int num_points = static_cast<int>(total_time / dt_) + 1;
         
         for (int i = 0; i < num_points; ++i)
@@ -358,16 +406,16 @@ private:
             
             TrajectoryPoint point;
             
-            // 使用梯形速度曲线计算位置、速度、加速度（使用限制的最大速度）
+            // Use trapezoidal velocity curve to calculate position, velocity, acceleration (with limited max velocity)
             calculateTrajectoryPointWithMaxVel(t, total_time, distance, direction, start, point, vertical_max_vel);
             point.time += time_offset;
             
-            // 垂直移动时平滑地将偏航角归零
+            // Smoothly reduce yaw to zero during vertical movement
             double initial_yaw = trajectory_.empty() ? last_yaw_ : trajectory_.back().yaw;
             double target_yaw = 0.0;
-            double yaw_progress = t / total_time;  // 从0到1的进度
+            double yaw_progress = t / total_time;  // Progress from 0 to 1
             
-            // 使用余弦插值实现更平滑的偏航角过渡
+            // Use cosine interpolation for smoother yaw transition
             double smooth_progress = (1.0 - cos(yaw_progress * M_PI)) * 0.5;
             point.yaw = initial_yaw * (1.0 - smooth_progress) + target_yaw * smooth_progress;
             point.yaw = normalizeAngle(point.yaw);
@@ -380,10 +428,10 @@ private:
     {
         if (trajectory_.empty()) return;
         
-        // 计算水平移动段的偏航角
+        // Calculate yaw for horizontal movement segment
         size_t start_index = 0;
         
-        // 找到当前段的起始位置
+        // Find start position of current segment
         for (size_t i = 1; i < trajectory_.size(); ++i)
         {
             if (std::abs(trajectory_[i].position.z() - trajectory_[i-1].position.z()) > 1e-3)
@@ -401,14 +449,14 @@ private:
             double vy = pt.velocity.y();
             double yaw = yaw_prev;
 
-            // 优先使用速度方向
+            // Prioritize velocity direction
             if (std::hypot(vx, vy) > 1e-3)
             {
                 yaw = std::atan2(vy, vx);
             }
             else if (i + 1 < trajectory_.size())
             {
-                // 使用相邻点的位移方向
+                // Use displacement direction between adjacent points
                 Eigen::Vector3d d = trajectory_[i + 1].position - pt.position;
                 if (std::hypot(d.x(), d.y()) > 1e-3)
                 {
@@ -429,11 +477,11 @@ private:
         double acc_time = max_vel_ / max_acc_;
         double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
         
-        double s, v, a;  // 位置、速度、加速度标量值
+        double s, v, a;  // Position, velocity, acceleration scalar values
         
         if (2 * acc_dist >= total_distance)
         {
-            // 三角形速度曲线
+            // Triangular velocity curve
             double peak_time = total_time / 2.0;
             if (t <= peak_time)
             {
@@ -452,7 +500,7 @@ private:
         }
         else
         {
-            // 梯形速度曲线
+            // Trapezoidal velocity curve
             if (t <= acc_time)
             {
                 s = 0.5 * max_acc_ * t * t;
@@ -474,11 +522,11 @@ private:
             }
         }
         
-        // 转换为3D向量
+        // Convert to 3D vectors
         point.position = start_pos + direction * s;
         point.velocity = direction * std::max(0.0, v);
         point.acceleration = direction * a;
-        // yaw 在生成轨迹后统一计算
+        // yaw will be calculated uniformly after trajectory generation
         point.yaw = last_yaw_;
         point.time = t;
     }
@@ -490,11 +538,11 @@ private:
         double acc_time = limited_max_vel / max_acc_;
         double acc_dist = 0.5 * max_acc_ * acc_time * acc_time;
         
-        double s, v, a;  // 位置、速度、加速度标量值
+        double s, v, a;  // Position, velocity, acceleration scalar values
         
         if (2 * acc_dist >= total_distance)
         {
-            // 三角形速度曲线
+            // Triangular velocity curve
             double peak_time = total_time / 2.0;
             if (t <= peak_time)
             {
@@ -513,7 +561,7 @@ private:
         }
         else
         {
-            // 梯形速度曲线
+            // Trapezoidal velocity curve
             if (t <= acc_time)
             {
                 s = 0.5 * max_acc_ * t * t;
@@ -535,11 +583,11 @@ private:
             }
         }
         
-        // 转换为3D向量
+        // Convert to 3D vectors
         point.position = start_pos + direction * s;
         point.velocity = direction * std::max(0.0, v);
         point.acceleration = direction * a;
-        // yaw 在生成轨迹后统一计算
+        // yaw will be calculated uniformly after trajectory generation
         point.yaw = last_yaw_;
         point.time = t;
     }
@@ -550,7 +598,7 @@ private:
         
         double current_time = (ros::Time::now() - traj_start_time_).toSec();
         
-        // 找到当前应该执行的轨迹点
+        // Find current trajectory point to execute
         while (current_traj_index_ < trajectory_.size() - 1 && 
                trajectory_[current_traj_index_ + 1].time <= current_time)
         {
@@ -562,8 +610,30 @@ private:
             current_traj_index_ = trajectory_.size() - 1;
         }
         
-        // 发布当前轨迹点
+        // Check if entering vertical descent phase
         const TrajectoryPoint& point = trajectory_[current_traj_index_];
+        if (!is_in_vertical_phase_ && current_traj_index_ > 0)
+        {
+            // Determine if starting vertical movement (significant Z velocity and small XY velocity)
+            if (std::abs(point.velocity.z()) > 0.1 && 
+                std::hypot(point.velocity.x(), point.velocity.y()) < 0.1)
+            {
+                is_in_vertical_phase_ = true;
+                ROS_INFO("[SimpleEgoPlanner] Entering vertical descent phase");
+            }
+        }
+        
+        // Check height sensor during vertical descent phase
+        if (is_in_vertical_phase_ && checkHeightForTargetReached())
+        {
+            // Altimeter distance < 2.0m indicates reaching target
+            current_state_ = IDLE;
+            has_target_ = false;
+            is_in_vertical_phase_ = false;
+            publishStopCommand();
+            return;
+        }
+        
         publishPositionCommand(point);
     }
     
@@ -574,39 +644,41 @@ private:
         cmd.header.stamp = ros::Time::now();
         cmd.header.frame_id = "map";
         
-        // 位置
+        // Position
         cmd.position.x = point.position.x();
         cmd.position.y = point.position.y();
         cmd.position.z = point.position.z();
         
-        // 速度
+        // Velocity
         cmd.velocity.x = point.velocity.x();
         cmd.velocity.y = point.velocity.y();
         cmd.velocity.z = point.velocity.z();
         
-        // 加速度
+        // Acceleration
         cmd.acceleration.x = point.acceleration.x();
         cmd.acceleration.y = point.acceleration.y();
         cmd.acceleration.z = point.acceleration.z();
         
-        // 偏航角
+        // Yaw angle
         cmd.yaw = point.yaw;
         cmd.yaw_dot = 0.0;
         
         pos_cmd_pub_.publish(cmd);
 
-        // 记录已发布的偏航角
+        // Record published yaw angle
         last_yaw_ = point.yaw;
     }
     
     void publishStopCommand()
     {
+        is_in_vertical_phase_ = false;  // Reset phase flag
+        
         quadrotor_msgs::PositionCommand cmd;
         
         cmd.header.stamp = ros::Time::now();
         cmd.header.frame_id = "map";
         
-        // 当前位置，零速度和加速度
+        // Current position, zero velocity and acceleration
         cmd.position.x = current_pos_.x();
         cmd.position.y = current_pos_.y();
         cmd.position.z = current_pos_.z();
@@ -619,13 +691,13 @@ private:
         cmd.acceleration.y = 0.0;
         cmd.acceleration.z = 0.0;
         
-        // 停止时偏航角归零，与垂直移动的最终状态保持一致
+        // Keep yaw at 0 degrees when stopped
         cmd.yaw = 0.0;
         cmd.yaw_dot = 0.0;
         
         pos_cmd_pub_.publish(cmd);
         
-        ROS_INFO("[SimpleEgoPlanner] Published stop command with yaw: 0.0 rad (0.0 deg)");
+        ROS_INFO("[SimpleEgoPlanner] Trajectory stopped. Ready for PX4CtrlFSM GPS correction.");
     }
     
     bool isGoalReached()
@@ -637,7 +709,7 @@ private:
     {
         visualization_msgs::MarkerArray marker_array;
         
-        // 轨迹线
+        // Trajectory line
         visualization_msgs::Marker line_marker;
         line_marker.header.frame_id = "map";
         line_marker.header.stamp = ros::Time::now();
@@ -701,6 +773,7 @@ int main(int argc, char** argv)
     
     ROS_INFO("[SimpleEgoPlanner] Node started. Use 2D Nav Goal in RViz to set target.");
     ROS_INFO("[SimpleEgoPlanner] Publishing to /planning/pos_cmd for PX4CtrlFSM");
+    ROS_INFO("[SimpleEgoPlanner] Monitoring /scan for height detection");
     
     ros::spin();
     
